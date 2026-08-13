@@ -119,13 +119,26 @@ fn dot_product(lhs: &[f32; QMF_DOUBLE_LENGTH], rhs: &[f32; QMF_DOUBLE_LENGTH]) -
     {
         unsafe { dot_product_neon(lhs.as_ptr(), rhs.as_ptr(), QMF_DOUBLE_LENGTH) }
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "arm", feature = "neon"))]
+    {
+        unsafe { dot_product_neon_arm(lhs.as_ptr(), rhs.as_ptr(), QMF_DOUBLE_LENGTH) }
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "arm", feature = "neon")
+    )))]
     {
         dot_product_scalar(lhs, rhs)
     }
 }
 
-#[cfg(any(test, not(target_arch = "aarch64")))]
+#[cfg(any(
+    test,
+    not(any(
+        target_arch = "aarch64",
+        all(target_arch = "arm", feature = "neon")
+    ))
+))]
 fn dot_product_scalar(lhs: &[f32], rhs: &[f32]) -> f32 {
     let mut sum = 0.0f32;
     for index in 0..lhs.len() {
@@ -152,7 +165,22 @@ fn dot_product_signed(
             )
         }
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "arm", feature = "neon"))]
+    {
+        unsafe {
+            dot_product_signed_neon_arm(
+                positive_lhs.as_ptr(),
+                positive_rhs.as_ptr(),
+                negative_lhs.as_ptr(),
+                negative_rhs.as_ptr(),
+                QMF_SUBBANDS,
+            )
+        }
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "arm", feature = "neon")
+    )))]
     {
         let mut sum = 0.0f32;
         for index in 0..QMF_SUBBANDS {
@@ -448,6 +476,149 @@ unsafe fn compute_inverse_output_neon(window: *const f32, output: *mut f32) {
         vst1q_f32(output.add(sample), acc);
         sample += 4;
     }
+}
+
+// 32-bit ARM (ARMv7-A) Advanced SIMD.
+//
+// Inline assembly rather than intrinsics, because on 32-bit ARM both
+// `core::arch::arm`'s NEON intrinsics (rust-lang/rust#111800) and
+// `#[target_feature(enable = "neon")]` (rust-lang/rust#150246) are still
+// unstable. Leaving it to the auto-vectoriser does not work either: ARMv7
+// Advanced SIMD flushes denormals to zero and so is not IEEE-754 conformant
+// for f32, and LLVM will not emit it for float arithmetic unless unsafe-math
+// is on, which this crate does not enable. AArch64's NEON *is* conformant,
+// which is why the path above can be plain safe intrinsics and this one
+// cannot.
+//
+// Gated on the crate's `neon` feature as well as the architecture. It cannot
+// be gated on `target_feature = "neon"`: on this target `-C
+// target-feature=+neon` sets no `target_feature` cfg at all, so such a gate
+// silently compiles to nothing. The feature is opt-in because emitting these
+// instructions unconditionally would fault on an ARMv6 or VFP-only CPU; a
+// build without it keeps the scalar path and still runs.
+//
+// The trade this accepts is that denormal inputs flush to zero here and do
+// not in the scalar path. For QMF filtering that is the conventional choice,
+// and it stays well inside the tolerance the reference tests assert.
+//
+// Only the two dot products are vectorised. They are ~96% of the filter
+// bank's multiply-accumulates: per frame `process_forward` spends 16,384 of
+// them in `dot_product` against 640 in the grouping, and `process_inverse`
+// 16,384 in `dot_product_signed` against 640 in the output stage. The other
+// two kernels keep the scalar path rather than carry hand-written assembly
+// for a twenty-fifth of the work.
+
+#[cfg(all(target_arch = "arm", feature = "neon"))]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[inline]
+unsafe fn dot_product_neon_arm(lhs: *const f32, rhs: *const f32, len: usize) -> f32 {
+    let blocks = len / 16;
+    let mut lanes = [0.0f32; 4];
+    if blocks > 0 {
+        core::arch::asm!(
+            ".fpu neon",
+            "vmov.i32 q12, #0",
+            "vmov.i32 q13, #0",
+            "vmov.i32 q14, #0",
+            "vmov.i32 q15, #0",
+            "2:",
+            "vld1.32 {{d0, d1, d2, d3}}, [{l}]!",
+            "vld1.32 {{d4, d5, d6, d7}}, [{l}]!",
+            "vld1.32 {{d16, d17, d18, d19}}, [{r}]!",
+            "vld1.32 {{d20, d21, d22, d23}}, [{r}]!",
+            "vmla.f32 q12, q0, q8",
+            "vmla.f32 q13, q1, q9",
+            "vmla.f32 q14, q2, q10",
+            "vmla.f32 q15, q3, q11",
+            "subs {n}, {n}, #1",
+            "bne 2b",
+            "vadd.f32 q12, q12, q13",
+            "vadd.f32 q14, q14, q15",
+            "vadd.f32 q12, q12, q14",
+            "vst1.32 {{d24, d25}}, [{o}]",
+            l = inout(reg) lhs => _,
+            r = inout(reg) rhs => _,
+            n = inout(reg) blocks => _,
+            o = in(reg) lanes.as_mut_ptr(),
+            out("q0") _, out("q1") _, out("q2") _, out("q3") _,
+            out("q8") _, out("q9") _, out("q10") _, out("q11") _,
+            out("q12") _, out("q13") _, out("q14") _, out("q15") _,
+            options(nostack),
+        );
+    }
+
+    let mut sum = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    let mut index = blocks * 16;
+    while index < len {
+        sum += *lhs.add(index) * *rhs.add(index);
+        index += 1;
+    }
+    sum
+}
+
+#[cfg(all(target_arch = "arm", feature = "neon"))]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[inline]
+unsafe fn dot_product_signed_neon_arm(
+    positive_lhs: *const f32,
+    positive_rhs: *const f32,
+    negative_lhs: *const f32,
+    negative_rhs: *const f32,
+    len: usize,
+) -> f32 {
+    let blocks = len / 16;
+    let mut lanes = [0.0f32; 4];
+    if blocks > 0 {
+        core::arch::asm!(
+            ".fpu neon",
+            "vmov.i32 q12, #0",
+            "vmov.i32 q13, #0",
+            "vmov.i32 q14, #0",
+            "vmov.i32 q15, #0",
+            "2:",
+            "vld1.32 {{d0, d1, d2, d3}}, [{pl}]!",
+            "vld1.32 {{d4, d5, d6, d7}}, [{pl}]!",
+            "vld1.32 {{d16, d17, d18, d19}}, [{pr}]!",
+            "vld1.32 {{d20, d21, d22, d23}}, [{pr}]!",
+            "vmla.f32 q12, q0, q8",
+            "vmla.f32 q13, q1, q9",
+            "vmla.f32 q14, q2, q10",
+            "vmla.f32 q15, q3, q11",
+            "vld1.32 {{d0, d1, d2, d3}}, [{nl}]!",
+            "vld1.32 {{d4, d5, d6, d7}}, [{nl}]!",
+            "vld1.32 {{d16, d17, d18, d19}}, [{nr}]!",
+            "vld1.32 {{d20, d21, d22, d23}}, [{nr}]!",
+            "vmls.f32 q12, q0, q8",
+            "vmls.f32 q13, q1, q9",
+            "vmls.f32 q14, q2, q10",
+            "vmls.f32 q15, q3, q11",
+            "subs {n}, {n}, #1",
+            "bne 2b",
+            "vadd.f32 q12, q12, q13",
+            "vadd.f32 q14, q14, q15",
+            "vadd.f32 q12, q12, q14",
+            "vst1.32 {{d24, d25}}, [{o}]",
+            pl = inout(reg) positive_lhs => _,
+            pr = inout(reg) positive_rhs => _,
+            nl = inout(reg) negative_lhs => _,
+            nr = inout(reg) negative_rhs => _,
+            n = inout(reg) blocks => _,
+            o = in(reg) lanes.as_mut_ptr(),
+            out("q0") _, out("q1") _, out("q2") _, out("q3") _,
+            out("q8") _, out("q9") _, out("q10") _, out("q11") _,
+            out("q12") _, out("q13") _, out("q14") _, out("q15") _,
+            options(nostack),
+        );
+    }
+
+    let mut sum = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    let mut index = blocks * 16;
+    while index < len {
+        sum += *positive_lhs.add(index) * *positive_rhs.add(index);
+        sum -= *negative_lhs.add(index) * *negative_rhs.add(index);
+        index += 1;
+    }
+    sum
 }
 
 #[cfg(test)]

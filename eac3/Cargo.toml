@@ -12,6 +12,16 @@ rust-version = "1.87.0"
 name = "eac3"
 crate-type = ["lib"]
 
+[features]
+default = []
+# Hand-written Advanced SIMD for the QMF dot products on 32-bit ARM. Opt-in
+# rather than automatic: `-C target-feature=+neon` sets no `target_feature`
+# cfg on this target, so the code cannot detect NEON for itself, and emitting
+# it unconditionally would fault on an ARMv6 or VFP-only CPU. Enable only for
+# a build whose target is known to have NEON. No effect on any other
+# architecture - AArch64 always uses its own intrinsic path.
+neon = []
+
 [dependencies]
 log = "0.4"
 rustfft = "6.4"

@@ -12,6 +12,8 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = []
 bridge-perf = []
+# Pass-through for the 32-bit ARM QMF SIMD path; see eac3/Cargo.toml.
+neon = ["eac3/neon"]
 
 # Path deps reach out of the workspace to the sibling Omniphony checkout:
 # `bridge/../../Omniphony` is the workflow symlink locally and the second

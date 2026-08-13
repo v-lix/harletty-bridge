@@ -47,9 +47,24 @@ pub struct Block {
     pub restart_header: Option<RestartHeader>,
     pub block_header: Option<BlockHeader>,
     pub block_data_bits: Option<u16>,
-    pub bypassed_lsb: [[i32; 16]; 160],
-    pub block_data: [[i32; 16]; 160],
+    /// Boxed so that moving a `Block` moves two pointers rather than 20 KB.
+    /// `Block::read` builds one per block and it is then pushed into the
+    /// segment's `Vec`, so the value is moved twice on every block; inline
+    /// arrays made those two moves a measurable share of TrueHD decode.
+    pub bypassed_lsb: Box<[[i32; 16]; 160]>,
+    pub block_data: Box<[[i32; 16]; 160]>,
     pub block_header_crc: u8,
+}
+
+/// Heap-allocate a zeroed block array without building it on the stack first.
+/// `Box::new([[0; 16]; 160])` would materialise 10 KB as a temporary and then
+/// copy it, which is the cost this boxing exists to remove; going through a
+/// zeroed `Vec` lets the allocator hand back zeroed pages directly.
+fn zeroed_block_array() -> Box<[[i32; 16]; 160]> {
+    let rows: Vec<[i32; 16]> = vec![[0i32; 16]; 160];
+    rows.into_boxed_slice()
+        .try_into()
+        .expect("exactly 160 rows were allocated")
 }
 
 impl Default for Block {
@@ -58,8 +73,8 @@ impl Default for Block {
             restart_header: None,
             block_header: None,
             block_data_bits: None,
-            bypassed_lsb: [[0; 16]; 160],
-            block_data: [[0; 16]; 160],
+            bypassed_lsb: zeroed_block_array(),
+            block_data: zeroed_block_array(),
             block_header_crc: 0,
         }
     }
@@ -540,8 +555,16 @@ impl Block {
         }
 
         let ss_state = state.substream_state_mut()?;
-        ss_state.bypassed_lsb = self.bypassed_lsb;
-        ss_state.block_data = self.block_data;
+        // Copy only the rows the decoder will actually read. `decode_access_unit`
+        // indexes both arrays over `0..block_size` and never past it, so rows
+        // beyond that are dead weight - and at 16 channels a row is 64 bytes,
+        // which made these two assignments a measurable share of decode. The
+        // bound is the decoder's own `block_size`, i.e. exactly the range it is
+        // about to walk, so the rows it reads are byte-for-byte what a whole-
+        // array copy would have left there.
+        let rows = ss_state.block_size.min(self.block_data.len());
+        ss_state.bypassed_lsb[..rows].copy_from_slice(&self.bypassed_lsb[..rows]);
+        ss_state.block_data[..rows].copy_from_slice(&self.block_data[..rows]);
 
         Ok(())
     }

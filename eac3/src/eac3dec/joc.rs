@@ -451,17 +451,54 @@ fn decode_parameter_points(
             if channel_indices.len() != data_points || vectors.len() != data_points {
                 return Err(ParseError::InvalidHeader("joc_sparse_points"));
             }
-            // The public documentation for this sparse coding path is ambiguous and
-            // reconstructing it naively produces obvious artifacts, so fall back to a zero
-            // matrix until the coding path is specified well enough to decode safely.
+            // ETSI TS 103 420 V1.2.1 clause 6.6.2 starts the differential
+            // coefficient chain at 50 (100 for the fine quantizer), while
+            // clause 6.6.4 dequantizes around 48 (96 for fine). Keep these
+            // distinct: the former initializes the transmitted chain, while
+            // the latter is the zero coefficient for an untransmitted channel.
+            let nquant = 96 * (quantization_table + 1);
+            let center = 48 * (quantization_table + 1);
+            let chain_offset = 50 * (quantization_table + 1);
+            let gain_step = 0.2f32 - quantization_table as f32 * 0.1f32;
             for data_point in 0..data_points {
                 if channel_indices[data_point].len() != bands || vectors[data_point].len() != bands
                 {
                     return Err(ParseError::InvalidHeader("joc_sparse_bands"));
                 }
-                for channel in &mut mix_matrix[data_point] {
-                    for band in &mut channel[..bands] {
-                        *band = 0.0;
+
+                let source_channels = &channel_indices[data_point];
+                let source_vectors = &vectors[data_point];
+                let mut selected_channel = source_channels[0] as usize;
+                if selected_channel >= channel_count {
+                    return Err(ParseError::InvalidHeader("joc_sparse_channel"));
+                }
+                let mut quantized = chain_offset;
+
+                for band_index in 0..bands {
+                    if band_index != 0 {
+                        // IDX symbols after the first band are modulo channel deltas.
+                        // ETSI TS 103 420 6.6.2 Pseudocode 2 adds the current delta to
+                        // the previous *encoded* delta. That loses the resolved channel
+                        // after two bands; carrying it is the only interpretation that
+                        // follows both the Huffman distribution and real sparse streams.
+                        selected_channel = (selected_channel
+                            + source_channels[band_index] as usize)
+                            % channel_count;
+                    }
+
+                    // VEC is differential along the one non-zero sparse vector, even
+                    // when that vector moves to another input channel. Looking up the
+                    // same channel in the previous band, as the published pseudocode
+                    // does, resets the differential whenever IDX changes.
+                    quantized = (quantized + source_vectors[band_index] as usize) % nquant;
+                    for channel_index in 0..channel_count {
+                        let value = if channel_index == selected_channel {
+                            quantized
+                        } else {
+                            center
+                        };
+                        mix_matrix[data_point][channel_index][band_index] =
+                            (value as f32 - center as f32) * gain_step;
                     }
                 }
             }
@@ -617,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn sparse_joc_falls_back_to_silence() {
+    fn sparse_joc_accumulates_channel_and_vector_deltas() {
         let object = JocObject {
             active: true,
             bands_index: Some(1),
@@ -638,11 +675,26 @@ mod tests {
         decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 5)
             .expect("points");
 
-        assert!(
-            mix_matrix[0]
-                .iter()
-                .all(|channel| channel[..3].iter().all(|value| *value == 0.0))
-        );
+        let close = |actual: f32, expected: f32| (actual - expected).abs() < 1e-6;
+
+        // The chain starts at the transmitted offset of 50, dequantizes around
+        // the zero at 48 with the published 0.2 step, and never restarts when
+        // the selected channel changes. Unselected channels are exactly zero.
+        assert!(close(mix_matrix[0][0][0], 1.2));
+        assert!(close(mix_matrix[0][1][0], 0.0));
+        assert!(close(mix_matrix[0][1][1], 2.2));
+        assert!(close(mix_matrix[0][1][2], 3.4));
+        assert!(close(mix_matrix[0][0][2], 0.0));
+
+        // Point 1 resolves channels 1, 1, 2. Band 2 therefore proves that IDX
+        // accumulates from the previous resolved channel (not adjacent raw
+        // deltas), and 5.2 proves that VEC carries across the channel change
+        // (rather than restarting from the offset at channel 2).
+        assert!(close(mix_matrix[1][1][0], 1.8));
+        assert!(close(mix_matrix[1][1][1], 3.4));
+        assert!(close(mix_matrix[1][2][2], 5.2));
+        assert!(close(mix_matrix[1][1][2], 0.0));
+
         assert!(
             mix_matrix[0]
                 .iter()
@@ -651,13 +703,70 @@ mod tests {
         assert!(
             mix_matrix[1]
                 .iter()
-                .all(|channel| channel[..3].iter().all(|value| *value == 0.0))
-        );
-        assert!(
-            mix_matrix[1]
-                .iter()
                 .all(|channel| channel[3..].iter().all(|value| *value == 2.0))
         );
+    }
+
+    #[test]
+    fn sparse_joc_wraps_channel_and_vector_deltas() {
+        let object = JocObject {
+            active: true,
+            bands_index: Some(1),
+            bands: 3,
+            sparse_coded: true,
+            quantization_table: Some(0),
+            steep_slope: false,
+            data_points: 1,
+            timeslot_offsets: Vec::new(),
+            data: Some(JocObjectData::Sparse {
+                channel_indices: vec![vec![4, 3, 0]],
+                vectors: vec![vec![90, 90, 90]],
+            }),
+        };
+
+        let mut mix_matrix = [vec![[7.0; 64]; 5], vec![[7.0; 64]; 5]];
+        let mut timeslot_offsets = [0; 2];
+        decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 5)
+            .expect("points");
+
+        // The selected channel walks 4 -> 2 -> 2 modulo five. The globally
+        // rolling vector walks 50 -> 44 -> 38 -> 32 modulo 96. Applying the
+        // published 0.2 step around centre 48 gives -0.8, -2.0 and -3.2;
+        // unselected channels are silent.
+        assert!((mix_matrix[0][4][0] - -0.8).abs() < 1e-6);
+        assert!((mix_matrix[0][2][1] - -2.0).abs() < 1e-6);
+        assert!((mix_matrix[0][2][2] - -3.2).abs() < 1e-6);
+        assert_eq!(mix_matrix[0][0][0], 0.0);
+        assert_eq!(mix_matrix[0][4][1], 0.0);
+    }
+
+    #[test]
+    fn fine_sparse_joc_scales_around_its_192_step_center() {
+        let object = JocObject {
+            active: true,
+            bands_index: Some(0),
+            bands: 1,
+            sparse_coded: true,
+            quantization_table: Some(1),
+            steep_slope: false,
+            data_points: 1,
+            timeslot_offsets: Vec::new(),
+            data: Some(JocObjectData::Sparse {
+                channel_indices: vec![vec![2]],
+                vectors: vec![vec![10]],
+            }),
+        };
+
+        let mut mix_matrix = [vec![[0.0; 64]; 5], vec![[0.0; 64]; 5]];
+        let mut timeslot_offsets = [0; 2];
+        decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 5)
+            .expect("points");
+
+        // Fine sparse: chain offset 100, centre 96, published step 0.1. The
+        // selected coefficient is (110 - 96) * 0.1; every other channel is
+        // the quantized zero.
+        assert!((mix_matrix[0][2][0] - 1.4).abs() < 1e-6);
+        assert_eq!(mix_matrix[0][0][0], 0.0);
     }
 
     /// The smooth branches are the ones nearly every block takes, and both

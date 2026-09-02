@@ -105,7 +105,7 @@ fn joc_master_set_matches_golden() {
     // hash pins one target rather than the algorithm. Decoding this same
     // fixture with the same source:
     //
-    //     x86_64-unknown-linux-gnu     70be2fef…   (the committed hash)
+    //     x86_64-unknown-linux-gnu     b1e58fe1…   (the committed hash)
     //     aarch64-unknown-linux-musl   —           (NEON QMF path, differs)
     //
     // Both are correct decodes. Asserting the hash off x86_64 would report a
@@ -114,15 +114,28 @@ fn joc_master_set_matches_golden() {
     // The aarch64 value moved with the last rebase below and was not
     // recomputed; nothing asserts it, so it is left unstated rather than stale.
     //
-    // Rebased four times: once when `float_to_i24` stopped scaling by
+    // Rebased five times: once when `float_to_i24` stopped scaling by
     // 2^23 - 1 and truncating (1.6% of samples moved one count away from zero,
     // no sign flips, max delta 1), once when the QMF scalar fallbacks stopped
     // accumulating into a single sum, once when the JOC parameter bands started
     // being expanded onto the subbands they cover on every path, and once when
     // the core was delayed to meet the objects it is written beside
     // (`JOC_LATENCY_SAMPLES`) — the bed channels of every JOC frame shift 577
-    // samples later. The last two change the audio on purpose; that is what
-    // they are for.
+    // samples later. And once when the JOC dequantization step became clause
+    // 6.6.4's exact 820/4096 rather than 0,2. That reads like a 0,098 %
+    // correction and is not one: the dense chain wraps in floating point
+    // against a `max` that is itself a multiple of the step, and 820/4096 is
+    // 205/1024, so every product is exact in f32 and the wrap lands where the
+    // integer arithmetic puts it. 0,2 is not representable in binary, and the
+    // rounding drifts chains over that boundary - a band belonging near the top
+    // of the quantizer comes back near the bottom, the whole 19,2 range wrong.
+    // One of the twenty-one channels carries it here; the other twenty are
+    // bit-identical. Channel 6 moves 22 887 of its 72 192 samples, 31,7 %, in
+    // 157 runs confined to the last third of the clip (1,017 s to 1,504 s);
+    // 10 652 of those change sign, and the largest delta is 1,98 full scale -
+    // what a near-full-scale sample inverting looks like. The peak does not
+    // move (0.999970 either way). The last three change the audio on purpose;
+    // that is what they are for.
     #[cfg(target_arch = "x86_64")]
     {
         let produced_audio = sha256_of(&audio_path);

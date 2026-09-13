@@ -223,6 +223,37 @@ impl Layout {
             _ => "Auro-3D",
         }
     }
+
+    /// What a listener calls this layout - `Auro 11.1`, `Auro 9.1` - for a host
+    /// that wants to name the presentation on screen.
+    ///
+    /// Counted off the layout's own streams rather than looked up, because a
+    /// table would be the same fact written twice and the copy that drifts.
+    /// Auro's number is the speakers the room needs: the floor and everything
+    /// above it before the dot, the LFE after it. That reproduces every
+    /// configuration a certified decoder has been read against - `5.1_4H` is
+    /// Auro 9.1, `7.1_4H` and `5.1_5H_1T` are both Auro 11.1, `7.1_5H_1T` is
+    /// Auro 13.1 - and goes on naming the ones nobody has read yet.
+    ///
+    /// `None` for a layout with nothing overhead, and for one whose name the
+    /// tables do not know. Neither is an Auro presentation: the first is an
+    /// ordinary speaker layout that Auro has no separate name for, and about
+    /// the second there is nothing truthful to say.
+    pub fn presentation_name(self) -> Option<String> {
+        let streams = self.streams()?;
+        let (mut floor, mut lfe, mut heights) = (0u32, 0u32, 0u32);
+        for &id in streams.as_slice() {
+            match id {
+                3 => lfe += 1,
+                9..=14 => heights += 1,
+                _ => floor += 1,
+            }
+        }
+        if heights == 0 {
+            return None;
+        }
+        Some(format!("Auro {}.{}", floor + heights, lfe))
+    }
 }
 
 /// A channel-input configuration: which original layout was folded into
@@ -340,6 +371,23 @@ mod tests {
         assert_eq!(Layout(26559).source_codec_label(), "Auro-3D-11.1");
         assert_eq!(Layout(30271).source_codec_label(), "Auro-3D-10.1");
         assert_eq!(Layout(26163).source_codec_label(), "Auro-3D");
+    }
+
+    #[test]
+    fn presentation_names_count_the_speakers_a_room_needs() {
+        // The six a certified decoder has been read against.
+        assert_eq!(Layout(26163).presentation_name().as_deref(), Some("Auro 8.0"));
+        assert_eq!(Layout(26175).presentation_name().as_deref(), Some("Auro 9.1"));
+        assert_eq!(Layout(30271).presentation_name().as_deref(), Some("Auro 10.1"));
+        assert_eq!(Layout(32319).presentation_name().as_deref(), Some("Auro 11.1"));
+        assert_eq!(Layout(26559).presentation_name().as_deref(), Some("Auro 11.1"));
+        assert_eq!(Layout(32703).presentation_name().as_deref(), Some("Auro 13.1"));
+
+        // A layout with nothing overhead is a speaker layout, not an Auro
+        // presentation, and an unknown id has nothing truthful to say.
+        assert_eq!(Layout(63).presentation_name(), None);
+        assert_eq!(Layout(447).presentation_name(), None);
+        assert_eq!(Layout(0xFFFFFF).presentation_name(), None);
     }
 
     #[test]

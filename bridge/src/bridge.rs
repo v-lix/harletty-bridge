@@ -993,6 +993,22 @@ impl FormatBridge for AtmosBridge {
         self.drc_mode = new_mode;
         true
     }
+
+    /// Auro-3D is the one presentation this bridge decodes that its container
+    /// does not name: the carrier is an ordinary DTS-HD MA track until the side
+    /// channel in its low bits has been read, so the host has nothing else to
+    /// go on. Everything else here - TrueHD, E-AC-3 JOC, DTS:X - is already
+    /// named by the codec id the host opened it with, and says nothing.
+    ///
+    /// Empty until the carrier is confirmed, which is the same gate the unfold
+    /// itself waits on: naming a presentation the decoder has not committed to
+    /// would put a label on screen that the next block could withdraw.
+    fn presentation_name(&self) -> RString {
+        if self.dts_active {
+            return RString::from(self.dts_auro.presentation_name());
+        }
+        RString::new()
+    }
 }
 
 #[cfg(test)]
@@ -1113,6 +1129,14 @@ mod raw_transport_tests {
         }
         assert!(bridge.dts_auro.is_unfolding(), "the carrier was not confirmed");
         assert!(!bridge.has_objects(), "Auro is fixed channels, not objects");
+        // The name the host puts on screen. Nothing in the container carries
+        // it, so this bridge is the only thing that can say it.
+        let presentation = bridge.presentation_name();
+        eprintln!("presentation {presentation:?}");
+        assert!(
+            presentation.as_str().starts_with("Auro "),
+            "expected an Auro presentation name, got {presentation:?}"
+        );
         // Every frame that came out is the unfolded layout: the carrier was
         // held back until the verdict, never emitted as 7.1.
         let channels = frames[0].channel_count;

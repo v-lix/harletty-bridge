@@ -65,6 +65,9 @@ enum Phase {
         speakers: Vec<usize>,
         outputs: Vec<StreamId>,
         labels: RVec<RChannelLabel>,
+        /// What the unfolded presentation is called, for the host to show.
+        /// Settled once here: the layout cannot change without a new detection.
+        presentation: String,
         sample_rate: u32,
         scratch: Vec<i32>,
     },
@@ -97,6 +100,17 @@ impl DtsAuroState {
         matches!(self.phase, Phase::Unfolding { .. })
     }
 
+    /// What the unfolded presentation is called - `Auro 11.1` - or empty while
+    /// the carrier is still undecided, once it has been ruled out, or for a
+    /// layout with no Auro name. Empty is the host's cue to say nothing, which
+    /// is right in every one of those cases.
+    pub(crate) fn presentation_name(&self) -> &str {
+        match &self.phase {
+            Phase::Unfolding { presentation, .. } => presentation,
+            _ => "",
+        }
+    }
+
     /// One built DTS-HD frame, whose first `speakers.len()` channels are the
     /// lossless bed in that speaker order, with the decoder's integer
     /// output for it. Appends to `out` whatever can go out now.
@@ -114,6 +128,7 @@ impl DtsAuroState {
                 speakers: carriers,
                 outputs,
                 labels,
+                presentation: _,
                 sample_rate,
                 scratch,
             } => {
@@ -249,6 +264,7 @@ impl DtsAuroState {
             speakers,
             outputs,
             labels,
+            presentation: detection.original.presentation_name().unwrap_or_default(),
             sample_rate,
             scratch,
         };

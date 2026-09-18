@@ -120,27 +120,44 @@ pub(crate) fn oamd_speaker_to_label(speaker_index: usize) -> RChannelLabel {
     }
 }
 
-/// Map an Auro stream to the renderer's channel label. Auro's height layer
-/// sits at about 30 degrees of elevation rather than overhead, and its
-/// centre height and top have no closer labels than the top-front-centre
-/// and top-centre ones; the renderer's channel mode places them.
+/// Map an Auro stream to the renderer's channel label.
+///
+/// Auro's own labels throughout, because Auro is a layout before it is a codec
+/// and it places every one of these itself: the floor at ±30 and ±110, the
+/// height layer over each of them at 30 degrees, the top overhead, all
+/// equidistant from the listener. The shared labels mean a room's corners, so
+/// they were wrong here by 20 degrees at the surrounds before they were wrong
+/// overhead - and no top label means "over the surrounds at 30º" at all. The
+/// renderer knows where Auro's are.
+///
+/// Two keep the shared labels, both because no Auro document gives them an
+/// angle: the LFE, which the guidelines send wherever it measures best rather
+/// than to a position, and the centre surround of the old 12.1 layouts. The
+/// 2011 white paper does define that layout - a 6.1 lower layer under a 6.0
+/// height layer - but never says where the channel it adds goes, and no layout
+/// id here pairs six floor channels with a height layer anyway, so it cannot
+/// reach an Auro presentation.
+///
+/// Stream 15, the second top of the `_2T` layouts, is left unlabelled: nothing
+/// public says which of the pair it is, and a guess would be placed as
+/// confidently as a fact.
 pub(crate) fn auro_stream_to_r(stream: auro::StreamId) -> RChannelLabel {
     match stream.0 {
-        0 => RChannelLabel::L,
-        1 => RChannelLabel::R,
-        2 => RChannelLabel::C,
+        0 => RChannelLabel::AuroL,
+        1 => RChannelLabel::AuroR,
+        2 => RChannelLabel::AuroC,
         3 => RChannelLabel::LFE,
-        4 => RChannelLabel::Ls,
-        5 => RChannelLabel::Rs,
+        4 => RChannelLabel::AuroLs,
+        5 => RChannelLabel::AuroRs,
         6 => RChannelLabel::Cb,
-        7 => RChannelLabel::Lb,
-        8 => RChannelLabel::Rb,
-        9 => RChannelLabel::Tfl,
-        10 => RChannelLabel::Tfr,
-        11 => RChannelLabel::Tfc,
-        12 => RChannelLabel::Tc,
-        13 => RChannelLabel::Tbl,
-        14 => RChannelLabel::Tbr,
+        7 => RChannelLabel::AuroLb,
+        8 => RChannelLabel::AuroRb,
+        9 => RChannelLabel::AuroHl,
+        10 => RChannelLabel::AuroHr,
+        11 => RChannelLabel::AuroHc,
+        12 => RChannelLabel::AuroT,
+        13 => RChannelLabel::AuroHls,
+        14 => RChannelLabel::AuroHrs,
         _ => RChannelLabel::Unknown,
     }
 }

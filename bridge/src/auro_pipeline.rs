@@ -435,17 +435,17 @@ mod tests {
         assert_eq!(
             labels.as_slice(),
             &[
-                RChannelLabel::L,
-                RChannelLabel::R,
-                RChannelLabel::Ls,
-                RChannelLabel::Rs,
-                RChannelLabel::Tfl,
-                RChannelLabel::Tfr,
-                RChannelLabel::Tbl,
-                RChannelLabel::Tbr,
+                RChannelLabel::AuroL,
+                RChannelLabel::AuroR,
+                RChannelLabel::AuroLs,
+                RChannelLabel::AuroRs,
+                RChannelLabel::AuroHl,
+                RChannelLabel::AuroHr,
+                RChannelLabel::AuroHls,
+                RChannelLabel::AuroHrs,
             ]
         );
-        // Sample 100: the L carrier announced HL, so L is silent and Tfl
+        // Sample 100: the L carrier announced HL, so L is silent and HL
         // carries the carrier with its borrowed bits cleared; R plays as R.
         let f = &out[0];
         let row = |s: usize| &f.pcm[s * 8..(s + 1) * 8];

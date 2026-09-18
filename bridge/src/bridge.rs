@@ -1144,8 +1144,8 @@ mod raw_transport_tests {
         assert!(frames.iter().all(|f| f.channel_count == channels));
         let labels = &frames[0].channel_labels;
         assert!(
-            labels.contains(&bridge_api::RChannelLabel::Tfl)
-                && labels.contains(&bridge_api::RChannelLabel::Tbr)
+            labels.contains(&bridge_api::RChannelLabel::AuroHl)
+                && labels.contains(&bridge_api::RChannelLabel::AuroHrs)
         );
         // Output is one block behind input, and no more.
         let emitted: u64 = frames.iter().map(|f| u64::from(f.sample_count)).sum();

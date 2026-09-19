@@ -1,8 +1,8 @@
 use abi_stable::std_types::RVec;
 use bridge_api::{RChannelLabel, RDecodedFrame, RMetadataFrame};
 use eac3::{
-    AccessUnitInfo, BedChannel, CorePcmFrame, FrameType, OamdPayload, ObjectPcmPushResult,
-    ParsedEmdfPayloadData, inspect_access_unit,
+    AccessUnitInfo, BedChannel, CorePcmFrame, FrameType, JocReconstruction, OamdPayload,
+    ObjectPcmPushResult, ParsedEmdfPayloadData, inspect_access_unit,
 };
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -25,11 +25,15 @@ const EAC3_SAMPLE_RATES: [u32; 3] = [48_000, 44_100, 32_000];
 ///
 /// Attempts object-level decode first (JOC + OAMD), then falls back to
 /// core PCM decode.  Converts the result into one [`RDecodedFrame`].
+///
+/// `info` is the caller's parse of `frame`, if it has one, so the diagnostic
+/// tally does not repeat it; `None` re-reads the frame as before.
 pub(crate) fn process_eac3_frame(
     bridge: &mut AtmosBridge,
     frame: &[u8],
+    info: Option<&AccessUnitInfo>,
 ) -> Result<RDecodedFrame, String> {
-    emit_eac3_frame_diagnostic(bridge, frame);
+    diagnose_eac3_unit(bridge, frame, info);
 
     match bridge.eac3_object_decoder.push_access_unit(frame) {
         Ok(Some(result)) => {
@@ -124,10 +128,8 @@ fn merge_eac3_core_with_dependent(
 /// Only a true independent substream may carry them; a converted-AC-3 frame
 /// (type 2) may not, so holding one back would add latency waiting for a
 /// partner that cannot arrive.
-pub(crate) fn eac3_frame_can_carry_dependents(frame: &[u8]) -> bool {
-    inspect_access_unit(frame)
-        .map(|info| info.frame_type == FrameType::Independent)
-        .unwrap_or(false)
+pub(crate) fn eac3_unit_can_carry_dependents(info: &AccessUnitInfo) -> bool {
+    info.frame_type == FrameType::Independent
 }
 
 /// Record the dialogue level of an access unit the bridge is holding rather
@@ -155,15 +157,33 @@ pub(crate) fn build_buffered_core_frame(
 /// reconstruction's inputs are channels a dependent carries. The last dependent
 /// then decides the outcome: a JOC payload there means objects, its absence
 /// means the merged bed.
+///
+/// `last_dependent_info` is the caller's parse of that deciding dependent -
+/// `None` when there are none, `Some(Err)` when it did not parse - so the unit
+/// whose JOC payload is the expensive one to read is read once per
+/// presentation rather than once per caller that asks a question about it.
 pub(crate) fn resolve_eac3_presentation(
     bridge: &mut AtmosBridge,
     core: CorePcmFrame,
     dependents: &[Vec<u8>],
+    last_dependent_info: Option<Result<AccessUnitInfo, String>>,
 ) -> Result<RDecodedFrame, String> {
     let mut bed = core;
     let mut merged_any = false;
-    for dependent in dependents {
-        emit_eac3_frame_diagnostic(bridge, dependent);
+    let last_index = dependents.len().saturating_sub(1);
+    for (index, dependent) in dependents.iter().enumerate() {
+        // The last dependent is the one the caller parsed, and on a JOC stream
+        // it is the one whose parse is expensive - it carries the payload. The
+        // rest are cheap and are read here as before.
+        let parsed = if index == last_index {
+            match &last_dependent_info {
+                Some(Ok(info)) => Some(info),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        diagnose_eac3_unit(bridge, dependent, parsed);
         match merge_eac3_core_with_dependent(bridge, &bed, dependent) {
             Some(merged) => {
                 bed = merged;
@@ -185,7 +205,13 @@ pub(crate) fn resolve_eac3_presentation(
     let Some(last) = dependents.last() else {
         return Err("presentation resolved with no dependents".to_owned());
     };
-    let dep_info = inspect_access_unit(last).map_err(|e| format!("{e}"))?;
+    let dep_info = match last_dependent_info {
+        Some(info) => info?,
+        // The caller holds the parse whenever it holds the dependents, so this
+        // is unreachable in the pipeline; parsing rather than asserting keeps
+        // the function usable on its own, as its tests call it.
+        None => inspect_access_unit(last).map_err(|e| format!("{e}"))?,
+    };
     update_eac3_dialogue_level(bridge, &dep_info);
 
     if dep_info.joc_payload_count() == 0 {
@@ -226,11 +252,15 @@ pub(crate) fn resolve_eac3_presentation(
         return Ok(build_eac3_channel_bed_frame(&bed, Some(&dep_info), bridge));
     }
 
+    // The bed moves into the reconstruction, and comes back out of it on the
+    // two outcomes that do not consume it. It used to be cloned here instead -
+    // a copy of the presentation's whole PCM, on every paired object frame, to
+    // serve the fallbacks that a healthy stream never takes.
     match bridge
         .eac3_object_decoder
-        .push_access_unit_with_core(last, bed.clone())
+        .push_access_unit_with_core(last, bed)
     {
-        Ok(Some(result)) => {
+        JocReconstruction::Objects(result) => {
             update_eac3_dialogue_level(bridge, &result.info);
             let sample_count = result.pcm.samples_per_channel();
             let base_sample_pos = bridge.eac3_total_samples;
@@ -239,7 +269,7 @@ pub(crate) fn resolve_eac3_presentation(
             bridge.perf.maybe_report(bridge.eac3_frame_count);
             maybe_dump_ok_frame(last, "depobj");
             Ok(build_eac3_frame_from_object(
-                result,
+                *result,
                 base_sample_pos,
                 bridge,
             ))
@@ -247,7 +277,7 @@ pub(crate) fn resolve_eac3_presentation(
         // The dependent announced a JOC payload the decoder then found nothing
         // in. The merged bed is real audio either way, and dropping the whole
         // interval to report that is worse than emitting it.
-        Ok(None) => {
+        JocReconstruction::NoPayload(bed) => {
             bridge.eac3_diag_stats.dependent_pair_no_object += 1;
             bridge.eac3_diag_stats.last_dependent_pair_error =
                 Some("no_object_payload".to_string());
@@ -256,7 +286,7 @@ pub(crate) fn resolve_eac3_presentation(
             bridge.eac3_total_samples += sample_count as u64;
             Ok(build_eac3_channel_bed_frame(&bed, Some(&dep_info), bridge))
         }
-        Err(err) => {
+        JocReconstruction::Failed(err, bed) => {
             let diag = eac3_frame_reject_diag(last);
             maybe_dump_reject_frame(last, "depobj");
             let message = format!("E-AC3 dependent object decode error: {err} {diag}");
@@ -283,10 +313,8 @@ pub(crate) fn is_legacy_ac3_frame(frame: &[u8]) -> bool {
 ///
 /// The payload rides in the last access unit of a presentation, so one that
 /// carries it ends the group.
-pub(crate) fn eac3_frame_carries_joc(frame: &[u8]) -> bool {
-    inspect_access_unit(frame)
-        .map(|info| info.joc_payload_count() > 0)
-        .unwrap_or(false)
+pub(crate) fn eac3_unit_carries_joc(info: &AccessUnitInfo) -> bool {
+    info.joc_payload_count() > 0
 }
 
 /// Whether this access unit carries a JOC payload its own channels satisfy.
@@ -317,44 +345,58 @@ pub(crate) fn eac3_frame_carries_joc(frame: &[u8]) -> bool {
 /// dependents with no core to attach to and lose the channels as well, which
 /// is the worse of the two, and reconstructing from the independent's own
 /// payload is machinery for a stream shape the specification forbids.
-pub(crate) fn eac3_frame_carries_self_contained_joc(frame: &[u8]) -> bool {
-    let Ok(info) = inspect_access_unit(frame) else {
-        return false;
-    };
+pub(crate) fn eac3_unit_carries_self_contained_joc(info: &AccessUnitInfo) -> bool {
     info.payloads().any(|payload| match &payload.parsed {
         ParsedEmdfPayloadData::Joc(joc) => usize::from(info.fullband_channels) >= joc.channel_count,
         _ => false,
     })
 }
 
-pub(crate) fn is_dependent_eac3_frame(frame: &[u8]) -> bool {
-    inspect_access_unit(frame)
-        .map(|info| info.frame_type == FrameType::Dependent)
-        .unwrap_or(false)
+pub(crate) fn eac3_unit_is_dependent(info: &AccessUnitInfo) -> bool {
+    info.frame_type == FrameType::Dependent
 }
 
-pub(crate) fn diagnose_eac3_frame(bridge: &mut AtmosBridge, frame: &[u8]) {
-    emit_eac3_frame_diagnostic(bridge, frame);
+/// Count an access unit into the per-kind diagnostic totals.
+///
+/// `info` is the caller's parse of `frame`. `None` means it did not parse as
+/// E-AC-3 - the legacy-AC-3 and not-ours cases - and the frame is re-read to
+/// classify it, which is cheap: those are exactly the units with no JOC
+/// payload to decode.
+pub(crate) fn diagnose_eac3_unit(
+    bridge: &mut AtmosBridge,
+    frame: &[u8],
+    info: Option<&AccessUnitInfo>,
+) {
+    match info {
+        Some(info) => {
+            bridge.eac3_diag_stats.total_frames += 1;
+            tally_access_unit(bridge, info);
+        }
+        None => emit_eac3_frame_diagnostic(bridge, frame),
+    }
+}
+
+/// Add one parsed access unit to the per-kind diagnostic totals.
+fn tally_access_unit(bridge: &mut AtmosBridge, info: &AccessUnitInfo) {
+    match info.frame_type {
+        FrameType::LegacyAc3 => bridge.eac3_diag_stats.legacy_ac3_frames += 1,
+        FrameType::Independent => bridge.eac3_diag_stats.independent_frames += 1,
+        FrameType::Dependent => bridge.eac3_diag_stats.dependent_frames += 1,
+        FrameType::Ac3Convert => bridge.eac3_diag_stats.ac3_convert_frames += 1,
+    }
+    if info.joc_payload_count() > 0 {
+        bridge.eac3_diag_stats.joc_frames += 1;
+    }
+    if info.oamd_payload_count() > 0 {
+        bridge.eac3_diag_stats.oamd_frames += 1;
+    }
 }
 
 fn emit_eac3_frame_diagnostic(bridge: &mut AtmosBridge, frame: &[u8]) {
     bridge.eac3_diag_stats.total_frames += 1;
 
     match inspect_access_unit(frame) {
-        Ok(info) => {
-            match info.frame_type {
-                FrameType::LegacyAc3 => bridge.eac3_diag_stats.legacy_ac3_frames += 1,
-                FrameType::Independent => bridge.eac3_diag_stats.independent_frames += 1,
-                FrameType::Dependent => bridge.eac3_diag_stats.dependent_frames += 1,
-                FrameType::Ac3Convert => bridge.eac3_diag_stats.ac3_convert_frames += 1,
-            }
-            if info.joc_payload_count() > 0 {
-                bridge.eac3_diag_stats.joc_frames += 1;
-            }
-            if info.oamd_payload_count() > 0 {
-                bridge.eac3_diag_stats.oamd_frames += 1;
-            }
-        }
+        Ok(info) => tally_access_unit(bridge, &info),
         Err(err) if format!("{err}") == "not-eac3" => {
             if legacy_ac3_info(frame).is_some() {
                 bridge.eac3_diag_stats.legacy_ac3_frames += 1;
@@ -1361,7 +1403,11 @@ mod tests {
         let mut frame = vec![0u8; 1234];
         frame[..8].copy_from_slice(&[0x0B, 0x77, 0x2A, 0x68, 0x22, 0x30, 0xE1, 0xFF]);
 
-        let decoded = process_eac3_frame(&mut bridge, &frame).expect("legacy AC-3 silence frame");
+        // `None` is what the caller passes for this frame: it does not parse as
+        // E-AC-3, which is the case the diagnostic tally re-reads to recognise
+        // as legacy AC-3 - asserted below.
+        let decoded =
+            process_eac3_frame(&mut bridge, &frame, None).expect("legacy AC-3 silence frame");
 
         assert_eq!(bridge.eac3_diag_stats.total_frames, 1);
         assert_eq!(bridge.eac3_diag_stats.legacy_ac3_frames, 1);
@@ -1590,6 +1636,109 @@ mod presentation_assembly {
         assert!(
             bridge.pending_eac3_core.is_some(),
             "the second independent is now the one being held"
+        );
+    }
+
+    /// The held independent reaches the host at the end of the stream.
+    ///
+    /// Holding a core costs nothing while more access units are coming, because
+    /// the next one releases it. The last one is never released: there is no
+    /// next access unit, and before `drain` existed the frame went out with the
+    /// pipeline - the final pending access unit, and the whole of a track short
+    /// enough to be one access unit, which is what this pushes.
+    #[test]
+    fn the_last_held_independent_is_emitted_on_drain() {
+        let mut bridge = AtmosBridge::new(false);
+        assert_eq!(
+            push(&mut bridge, INDEPENDENT),
+            0,
+            "the only independent is held, since nothing yet says it stands alone"
+        );
+
+        let drained = bridge.drain();
+        assert_eq!(
+            drained.frames.len(),
+            1,
+            "the end of the stream is what says it stands alone, so it must come out"
+        );
+        assert!(
+            drained.error_message.is_empty(),
+            "a presentation that resolves is not an error: {}",
+            drained.error_message
+        );
+        assert!(
+            bridge.pending_eac3_core.is_none(),
+            "the drained presentation must not still be pending"
+        );
+    }
+
+    /// Draining twice emits the frame once.
+    ///
+    /// A host that cannot tell whether it has already drained - one that drains
+    /// on both an explicit stop and the stream ending, say - must not get the
+    /// tail of the track twice.
+    #[test]
+    fn draining_again_emits_nothing() {
+        let mut bridge = AtmosBridge::new(false);
+        push(&mut bridge, INDEPENDENT);
+
+        assert_eq!(bridge.drain().frames.len(), 1, "the first drain emits it");
+        assert_eq!(
+            bridge.drain().frames.len(),
+            0,
+            "the second has nothing left to emit"
+        );
+    }
+
+    /// Draining an idle bridge is safe and silent.
+    ///
+    /// Nothing was pushed, so nothing is held. A host may call this
+    /// unconditionally at the end of a track it never fed.
+    #[test]
+    fn draining_an_idle_bridge_emits_nothing() {
+        let mut bridge = AtmosBridge::new(false);
+        let drained = bridge.drain();
+
+        assert_eq!(drained.frames.len(), 0);
+        assert!(drained.error_message.is_empty());
+        assert!(!drained.did_reset);
+    }
+
+    /// A presentation already emitted leaves nothing to drain.
+    ///
+    /// The self-contained JOC frame goes out on arrival rather than being held,
+    /// so the drain after it must not manufacture a second copy of it.
+    #[test]
+    fn a_presentation_emitted_on_arrival_is_not_emitted_again_on_drain() {
+        let mut bridge = AtmosBridge::new(false);
+        assert_eq!(push(&mut bridge, SELF_CONTAINED_JOC), 1);
+
+        assert_eq!(
+            bridge.drain().frames.len(),
+            0,
+            "nothing was held, so the drain has nothing to release"
+        );
+    }
+
+    /// A seek still discards what it is holding.
+    ///
+    /// `reset` and `drain` resolve the same state in opposite directions, and
+    /// the distinction is the point: the audio a seek moves away from must not
+    /// play, so `reset` must not have quietly become a drain.
+    #[test]
+    fn a_reset_discards_the_held_independent_rather_than_emitting_it() {
+        let mut bridge = AtmosBridge::new(false);
+        push(&mut bridge, INDEPENDENT);
+
+        bridge.reset();
+        assert!(
+            bridge.pending_eac3_core.is_none(),
+            "the seek discards the held presentation"
+        );
+        assert_eq!(
+            bridge.drain().frames.len(),
+            0,
+            "and a drain after it finds nothing to emit"
         );
     }
 

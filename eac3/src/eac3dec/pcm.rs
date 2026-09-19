@@ -205,6 +205,33 @@ pub struct ObjectPcmPushResult {
     pub pcm: ObjectPcmFrame,
 }
 
+/// What [`PcmDecoder::push_access_unit_with_core`] did with the core it was
+/// offered.
+///
+/// Only one of the three outcomes consumes that core, and the caller's answer
+/// to the other two is the same: emit the core it already had as a channel
+/// bed. So the core is handed back rather than dropped, which is the whole
+/// reason this is an enum and not a `Result<Option<_>, _>` — a caller cannot
+/// know in advance which outcome it will get, and the alternative is to clone
+/// the frame's entire PCM before every call to keep a copy for the two
+/// outcomes that do not happen.
+#[derive(Debug)]
+pub enum JocReconstruction {
+    /// Objects were reconstructed. The core was the reconstruction's input and
+    /// the decoder has kept it as the next frame's history.
+    ///
+    /// Boxed because it is much the largest of the three and every outcome
+    /// would otherwise be as wide as it is.
+    Objects(Box<ObjectPcmPushResult>),
+    /// The access unit declared a JOC payload that the decoder then found
+    /// nothing in. The core is untouched.
+    NoPayload(CorePcmFrame),
+    /// The access unit did not decode. The core comes back as it went in -
+    /// the reconstruction either never saw it, or failed before consuming it -
+    /// and the decoder's cross-frame state has been reset.
+    Failed(ParseError, CorePcmFrame),
+}
+
 #[derive(Debug)]
 /// Stateful decoder for the core channel PCM path.
 ///
@@ -790,51 +817,73 @@ impl ObjectPcmDecoder {
 
     /// Decode dynamic object PCM from a dependent access unit using externally decoded core PCM.
     ///
-    /// On `Err`, the decoder's cross-frame state is reset (see
-    /// [`PcmDecoder::push_access_unit`]).
+    /// The core comes back untouched on both outcomes that do not reconstruct
+    /// against it, because the caller's fallback for either is to emit that
+    /// core as a channel bed. Handing it back is what lets the caller keep one
+    /// copy: it used to have to clone the frame's whole PCM before every call,
+    /// on the chance that this one would be the frame that failed.
+    ///
+    /// On [`JocReconstruction::Failed`], the decoder's cross-frame state is
+    /// reset (see [`PcmDecoder::push_access_unit`]).
     pub fn push_access_unit_with_core(
         &mut self,
         access_unit: &[u8],
         core: CorePcmFrame,
-    ) -> Result<Option<ObjectPcmPushResult>, ParseError> {
-        self.push_access_unit_with_core_inner(access_unit, core)
-            .inspect_err(|_| {
-                self.reset_decode_state();
-            })
+    ) -> JocReconstruction {
+        let outcome = self.push_access_unit_with_core_inner(access_unit, core);
+        if matches!(outcome, JocReconstruction::Failed(..)) {
+            self.reset_decode_state();
+        }
+        outcome
     }
 
     fn push_access_unit_with_core_inner(
         &mut self,
         access_unit: &[u8],
         joc_input_core: CorePcmFrame,
-    ) -> Result<Option<ObjectPcmPushResult>, ParseError> {
+    ) -> JocReconstruction {
         self.apply_debug_log_level();
-        let info = inspect_access_unit_with_metadata_state(
+        let info = match inspect_access_unit_with_metadata_state(
             access_unit,
             &mut self.metadata_state,
             Some(&mut self.aux_state),
-        )?;
+        ) {
+            Ok(info) => info,
+            Err(err) => return JocReconstruction::Failed(err, joc_input_core),
+        };
 
         if access_unit.len() < info.frame_size {
-            return Err(ParseError::TruncatedFrame {
-                expected: info.frame_size,
-                available: access_unit.len(),
-            });
+            return JocReconstruction::Failed(
+                ParseError::TruncatedFrame {
+                    expected: info.frame_size,
+                    available: access_unit.len(),
+                },
+                joc_input_core,
+            );
         }
         if access_unit.len() != info.frame_size {
-            return Err(ParseError::TrailingData {
-                expected: info.frame_size,
-                provided: access_unit.len(),
-            });
+            return JocReconstruction::Failed(
+                ParseError::TrailingData {
+                    expected: info.frame_size,
+                    provided: access_unit.len(),
+                },
+                joc_input_core,
+            );
         }
 
         let Some(joc) = find_joc_payload(&info) else {
-            return Ok(None);
+            return JocReconstruction::NoPayload(joc_input_core);
         };
-        let (info, joc) = self.joc_payload_for_reconstruction(access_unit, info, joc)?;
+        let (info, joc) = match self.joc_payload_for_reconstruction(access_unit, info, joc) {
+            Ok(pair) => pair,
+            Err(err) => return JocReconstruction::Failed(err, joc_input_core),
+        };
 
         self.reset_history_if_reconfigured(&joc_input_core);
-        let object_channels = self.joc_state.decode_frame(&joc_input_core, &joc)?;
+        let object_channels = match self.joc_state.decode_frame(&joc_input_core, &joc) {
+            Ok(channels) => channels,
+            Err(err) => return JocReconstruction::Failed(err, joc_input_core),
+        };
         // As in `push_access_unit_inner`: hold the core back to meet the
         // objects, once it has served as the reconstruction's input.
         let core = self.core_delay.delayed(&joc_input_core);
@@ -851,7 +900,7 @@ impl ObjectPcmDecoder {
             .collect();
 
         self.frames_seen += 1;
-        Ok(Some(ObjectPcmPushResult {
+        JocReconstruction::Objects(Box::new(ObjectPcmPushResult {
             frames_seen: self.frames_seen,
             info,
             pcm: ObjectPcmFrame {

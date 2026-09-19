@@ -2,8 +2,8 @@ use super::eac3_handler::Eac3FrameMessage;
 use crate::input::InputReader;
 use anyhow::Result;
 use eac3::{
-    AccessUnitParseError, ExtractError, Extractor, Frame, FrameType, ObjectPcmDecoder, PcmDecoder,
-    PcmPushResult, inspect_access_unit, merge_core_with_dependent,
+    AccessUnitParseError, ExtractError, Extractor, Frame, FrameType, JocReconstruction,
+    ObjectPcmDecoder, PcmDecoder, PcmPushResult, inspect_access_unit, merge_core_with_dependent,
 };
 use indicatif::ProgressBar;
 use std::path::PathBuf;
@@ -253,7 +253,7 @@ fn handle_frame(
 /// bed, merged into a full 7.1 frame (falling back to the 5.1 core alone if
 /// the merge fails — never silent). Exactly one message is emitted per pair.
 fn handle_core_pair(
-    core_result: PcmPushResult,
+    mut core_result: PcmPushResult,
     frame: &Frame,
     state: &mut DecoderState,
     pb: &Option<ProgressBar>,
@@ -269,20 +269,24 @@ fn handle_core_pair(
     };
 
     if dep_info.joc_payload_count() > 0 {
+        // The core moves in and comes back on the outcomes that do not consume
+        // it, so the channel-bed fallback below still has it without this
+        // having cloned the frame's PCM for every call that succeeds.
         match state
             .object_decoder
-            .push_access_unit_with_core(bytes, core_result.pcm.clone())
+            .push_access_unit_with_core(bytes, core_result.pcm)
         {
-            Ok(Some(obj)) => {
+            JocReconstruction::Objects(obj) => {
                 state.frame_count += 1;
                 tick_progress(pb);
-                let _ = tx.send(Ok(Eac3FrameMessage::Object(obj)));
+                let _ = tx.send(Ok(Eac3FrameMessage::Object(*obj)));
                 return Ok(());
             }
-            Ok(None) => {
+            JocReconstruction::NoPayload(core) => {
                 // No object payload after all — fall through to the channel bed.
+                core_result.pcm = core;
             }
-            Err(err) => {
+            JocReconstruction::Failed(err, _) => {
                 return surface_decode_err(err, strict_mode, tx, pb, state, &frame.info());
             }
         }
@@ -322,19 +326,24 @@ fn handle_emitted_object_pair(
         .object_decoder
         .push_access_unit_with_core(frame.as_bytes(), joc_input)
     {
-        Ok(Some(obj)) => {
+        JocReconstruction::Objects(obj) => {
             state.frame_count += 1;
             tick_progress(pb);
-            let _ = tx.send(Ok(Eac3FrameMessage::Object(obj)));
+            let _ = tx.send(Ok(Eac3FrameMessage::Object(*obj)));
             Ok(())
         }
-        Ok(None) => {
+        // The core comes back unused here, and the doc comment above says why
+        // it is dropped rather than emitted: the frame's bed has already been
+        // sent, so emitting it again would write it twice.
+        JocReconstruction::NoPayload(_) => {
             log::warn!(
                 "dropping E-AC-3 dependent substream without JOC after an already-emitted object frame"
             );
             Ok(())
         }
-        Err(err) => surface_decode_err(err, strict_mode, tx, pb, state, &frame.info()),
+        JocReconstruction::Failed(err, _) => {
+            surface_decode_err(err, strict_mode, tx, pb, state, &frame.info())
+        }
     }
 }
 

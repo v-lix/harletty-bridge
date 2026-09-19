@@ -17,7 +17,18 @@
 //! out the same both times, because its counter cannot follow itself and the
 //! second decode therefore starts cold.
 
-use eac3::ObjectPcmDecoder;
+use eac3::{JocReconstruction, ObjectPcmDecoder, ObjectPcmFrame};
+
+/// The reconstructed objects, or a failure naming the outcome that came back
+/// instead. The fixture carries JOC, so anything else is the test's own
+/// assertion failing rather than a case to handle.
+fn objects(outcome: JocReconstruction) -> ObjectPcmFrame {
+    match outcome {
+        JocReconstruction::Objects(result) => result.pcm,
+        JocReconstruction::NoPayload(_) => panic!("fixture carries JOC objects"),
+        JocReconstruction::Failed(err, _) => panic!("fixture must decode: {err:?}"),
+    }
+}
 
 const FIXTURE: &[u8] = include_bytes!("data/short_packet_independent_joc.bin");
 
@@ -104,16 +115,8 @@ fn the_external_core_path_cold_starts_at_a_splice_too() {
     };
 
     let mut decoder = ObjectPcmDecoder::default();
-    let first = decoder
-        .push_access_unit_with_core(FIXTURE, core.clone())
-        .expect("fixture must decode")
-        .expect("fixture carries JOC objects")
-        .pcm;
-    let second = decoder
-        .push_access_unit_with_core(FIXTURE, core.clone())
-        .expect("fixture must decode")
-        .expect("fixture carries JOC objects")
-        .pcm;
+    let first = objects(decoder.push_access_unit_with_core(FIXTURE, core.clone()));
+    let second = objects(decoder.push_access_unit_with_core(FIXTURE, core.clone()));
 
     for (index, (a, b)) in first
         .object_channels
@@ -129,11 +132,7 @@ fn the_external_core_path_cold_starts_at_a_splice_too() {
     }
 
     let mut cold = ObjectPcmDecoder::default();
-    let from_cold = cold
-        .push_access_unit_with_core(FIXTURE, core)
-        .expect("fixture must decode")
-        .expect("fixture carries JOC objects")
-        .pcm;
+    let from_cold = objects(cold.push_access_unit_with_core(FIXTURE, core));
     assert_eq!(
         second.object_channels, from_cold.object_channels,
         "the paired frame after a splice must reconstruct as it would from cold"

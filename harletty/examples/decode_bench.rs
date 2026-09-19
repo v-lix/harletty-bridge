@@ -220,8 +220,9 @@ fn truehd_pass(data: &[u8], presentation: usize) -> Tally {
 /// which is what FFmpeg decodes.
 fn eac3_pass(data: &[u8], objects: bool) -> Tally {
     use eac3::{
-        AccessUnitInfo, CorePcmFrame, ObjectPcmDecoder, PcmDecoder, PcmPushResult,
-        inspect_access_unit, merge_core_with_decoded_dependent, merge_core_with_dependent,
+        AccessUnitInfo, CorePcmFrame, JocReconstruction, ObjectPcmDecoder, PcmDecoder,
+        PcmPushResult, inspect_access_unit, merge_core_with_decoded_dependent,
+        merge_core_with_dependent,
     };
 
     /// As the CLI's `read_dependent`: a dependent expected to be a channel
@@ -307,18 +308,22 @@ fn eac3_pass(data: &[u8], objects: bool) -> Tally {
         }
         if let Some(dependent_read) = dependent_read {
             match pending.take() {
-                Some(Pending::Core(core)) => {
+                Some(Pending::Core(mut core)) => {
                     let info = match &dependent_read {
                         Dependent::Inspected { info, .. } => info,
                         Dependent::Decoded(push) => &push.info,
                     };
                     let joc = objects && info.joc_payload_count() > 0;
                     if joc {
-                        if let Ok(Some(obj)) =
-                            object_decoder.push_access_unit_with_core(bytes, core.clone())
-                        {
-                            count_objects(tally, &obj.pcm);
-                            return;
+                        // As the CLI: the core comes back when it is not
+                        // consumed, so the bed below is made without a clone.
+                        match object_decoder.push_access_unit_with_core(bytes, core) {
+                            JocReconstruction::Objects(obj) => {
+                                count_objects(tally, &obj.pcm);
+                                return;
+                            }
+                            JocReconstruction::NoPayload(back)
+                            | JocReconstruction::Failed(_, back) => core = back,
                         }
                     }
                     object_decoder.note_non_joc_presentation();
@@ -338,7 +343,7 @@ fn eac3_pass(data: &[u8], objects: bool) -> Tally {
                     count_core(tally, &bed);
                 }
                 Some(Pending::Object(Some(joc_input))) => {
-                    if let Ok(Some(obj)) =
+                    if let JocReconstruction::Objects(obj) =
                         object_decoder.push_access_unit_with_core(bytes, joc_input)
                     {
                         count_objects(tally, &obj.pcm);

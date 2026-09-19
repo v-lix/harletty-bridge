@@ -1,8 +1,8 @@
 use abi_stable::std_types::RVec;
 use bridge_api::{RChannelLabel, RDecodedFrame, RMetadataFrame};
 use eac3::{
-    AccessUnitInfo, AccessUnitParseError, BedChannel, CorePcmFrame, FrameType, OamdPayload,
-    ObjectPcmPushResult, ParsedEmdfPayloadData, inspect_access_unit,
+    AccessUnitInfo, AccessUnitParseError, BedChannel, CorePcmFrame, FrameType, JocReconstruction,
+    OamdPayload, ObjectPcmPushResult, ParsedEmdfPayloadData, inspect_access_unit,
 };
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -437,9 +437,9 @@ pub(crate) fn resolve_eac3_presentation(
 
     match bridge
         .eac3_object_decoder
-        .push_access_unit_with_core(last, bed.clone())
+        .push_access_unit_with_core(last, bed)
     {
-        Ok(Some(result)) => {
+        JocReconstruction::Objects(result) => {
             update_eac3_dialogue_level(bridge, &result.info);
             let sample_count = result.pcm.samples_per_channel();
             let base_sample_pos = bridge.eac3_total_samples;
@@ -448,7 +448,7 @@ pub(crate) fn resolve_eac3_presentation(
             bridge.perf.maybe_report(bridge.eac3_frame_count);
             maybe_dump_ok_frame(last, "depobj");
             Ok(build_eac3_frame_from_object(
-                result,
+                *result,
                 base_sample_pos,
                 bridge,
             ))
@@ -456,7 +456,7 @@ pub(crate) fn resolve_eac3_presentation(
         // The dependent announced a JOC payload the decoder then found nothing
         // in. The merged bed is real audio either way, and dropping the whole
         // interval to report that is worse than emitting it.
-        Ok(None) => {
+        JocReconstruction::NoPayload(bed) => {
             bridge.eac3_diag_stats.dependent_pair_no_object += 1;
             bridge.eac3_diag_stats.last_dependent_pair_error =
                 Some("no_object_payload".to_string());
@@ -465,7 +465,7 @@ pub(crate) fn resolve_eac3_presentation(
             bridge.eac3_total_samples += sample_count as u64;
             Ok(build_eac3_channel_bed_frame(&bed, Some(&dep_info), bridge))
         }
-        Err(err) => {
+        JocReconstruction::Failed(err, bed) => {
             let diag = eac3_frame_reject_diag(last);
             maybe_dump_reject_frame(last, "depobj");
             let message = format!("E-AC3 dependent object decode error: {err} {diag}");

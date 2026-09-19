@@ -1011,6 +1011,34 @@ impl FormatBridge for AtmosBridge {
         // continuous-mode timestamping. The handler manages segment offsets.
     }
 
+    /// Resolve the E-AC-3 presentation still in hand, because no access unit is
+    /// coming to end it.
+    ///
+    /// An independent substream is held until the next unit says whether a
+    /// dependent follows it (see `process_eac3_access_unit`), so one can remain
+    /// at the end of a stream. It may be the whole of a track short enough to
+    /// be one access unit. `reset` throws the same frame away, which is what a
+    /// seek wants and an ending does not.
+    ///
+    /// Only the E-AC-3 path is drained. The TrueHD and DTS paths emit each
+    /// access unit as it completes and have nothing buffered to release; the
+    /// opt-in IAMF path is left as it is.
+    ///
+    /// A resolve failure is reported the way one during playback is - the
+    /// message in `error_message`, the pipeline reset - rather than being
+    /// swallowed because the stream is ending anyway.
+    fn drain(&mut self) -> RPushResult {
+        let mut result = RPushResult {
+            frames: RVec::new(),
+            error_message: RString::new(),
+            did_reset: false,
+        };
+        // `finish_presentation` takes the pending presentation, so a second
+        // drain finds nothing and returns no frames.
+        let _ = self.finish_presentation(&mut result);
+        result
+    }
+
     fn is_ready(&self) -> bool {
         #[cfg(feature = "iamf")]
         if self.iamf.frame_count > 0 {

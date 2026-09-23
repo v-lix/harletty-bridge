@@ -132,6 +132,7 @@ pub(crate) struct DtsXState {
     parse_failures: u64,
     feed_dropouts: u64,
     bed_extension_dropouts: u64,
+    undecodable_extensions: u64,
 }
 
 impl DtsXState {
@@ -168,6 +169,21 @@ impl DtsXState {
             log::warn!(
                 "dts: extension waveforms unavailable ({reason}, {} frames so far); emitting silent extension channels",
                 self.feed_dropouts
+            );
+        }
+    }
+
+    /// A frame carries a DTS:X extension and no presentation has been
+    /// latched to fall back on: the bed plays as authored, the extension's
+    /// contribution still folded into it. Without this, a form that never
+    /// decodes - any alternate profile on a lossy carrier, among them - would
+    /// play for its whole length without a word about why it is flat.
+    fn note_undecodable_extension(&mut self, reason: &str) {
+        self.undecodable_extensions += 1;
+        if self.undecodable_extensions == 1 || self.undecodable_extensions.is_power_of_two() {
+            log::warn!(
+                "dts: DTS:X extension not decodable ({reason}, {} frames so far); playing the bed as authored",
+                self.undecodable_extensions
             );
         }
     }
@@ -432,7 +448,14 @@ fn build_hd_frame_with_extensions(
             }
             locked
         }
-        (None, None) => return Some((bed_only_frame(hd, &active, &bed, sample_count), false)),
+        (None, None) => {
+            if hd.x_present || hd.x_imax {
+                state.note_undecodable_extension(
+                    hd.x_decode_error.unwrap_or("no usable waveform set"),
+                );
+            }
+            return Some((bed_only_frame(hd, &active, &bed, sample_count), false));
+        }
     };
     let feeds: &[Vec<f32>] = if detected.is_some() {
         hd.x_samples.as_slice()
@@ -926,6 +949,25 @@ mod tests {
             assert_eq!(row[1], float_to_pcm_i32(composite_left[sample]));
             assert!(row[8..12].iter().all(|&s| s == 0));
         }
+    }
+
+    #[test]
+    fn an_extension_that_never_decodes_is_reported_and_the_bed_plays() {
+        // An alternate profile on a lossy carrier: the extension is found,
+        // nothing of it decodes, and no earlier frame latched a presentation.
+        let mut hd = hd_frame(full_bed(), Vec::new());
+        hd.x_imax = true;
+        hd.x_decode_error = Some("alternate profile on a lossy carrier");
+        let mut state = DtsXState::default();
+        let (frame, objects) = build(&hd, &mut state);
+        assert!(!objects);
+        assert_eq!(frame.channel_count, 8);
+        assert_eq!(state.undecodable_extensions, 1);
+
+        // A frame with no extension at all has nothing to report.
+        let (frame, _) = build(&hd_frame(full_bed(), Vec::new()), &mut state);
+        assert_eq!(frame.channel_count, 8);
+        assert_eq!(state.undecodable_extensions, 1);
     }
 
     #[test]

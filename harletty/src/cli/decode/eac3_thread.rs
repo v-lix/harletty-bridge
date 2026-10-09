@@ -2,8 +2,8 @@ use super::eac3_handler::Eac3FrameMessage;
 use crate::input::InputReader;
 use anyhow::Result;
 use eac3::{
-    AccessUnitParseError, ExtractError, Extractor, Frame, ObjectPcmDecoder, PcmDecoder,
-    PcmPushResult, StreamType, inspect_access_unit, merge_core_with_decoded_dependent,
+    AccessUnitParseError, ExtractError, Extractor, Frame, JocReconstruction, ObjectPcmDecoder,
+    PcmDecoder, PcmPushResult, StreamType, inspect_access_unit, merge_core_with_decoded_dependent,
     merge_core_with_dependent,
 };
 use indicatif::ProgressBar;
@@ -429,18 +429,19 @@ fn handle_core_pair(
             return Ok(());
         }
 
-        match state
-            .object_decoder
-            .push_access_unit_with_core(bytes, bed.clone())
-        {
-            Ok(Some(obj)) => {
+        // The bed moves in and comes back on the outcomes that do not consume
+        // it, so the answer below still has it without this having cloned the
+        // frame's PCM for every call that succeeds.
+        match state.object_decoder.push_access_unit_with_core(bytes, bed) {
+            JocReconstruction::Objects(obj) => {
                 state.frame_count += 1;
                 tick_progress(pb);
-                let _ = tx.send(Ok(Eac3FrameMessage::Object(obj)));
+                let _ = tx.send(Ok(Eac3FrameMessage::Object(*obj)));
                 return Ok(());
             }
-            Ok(None) => {
-                // No object payload after all: the merged bed is the answer.
+            JocReconstruction::NoPayload(bed) => {
+                // No object payload after all: the merged bed, handed back, is
+                // the answer.
                 state.object_decoder.note_non_joc_presentation();
                 state.frame_count += 1;
                 tick_progress(pb);
@@ -451,7 +452,7 @@ fn handle_core_pair(
                 })));
                 return Ok(());
             }
-            Err(err) => {
+            JocReconstruction::Failed(err, _) => {
                 return surface_decode_err(err, strict_mode, tx, pb, state, &frame.info());
             }
         }
@@ -507,19 +508,24 @@ fn handle_emitted_object_pair(
         .object_decoder
         .push_access_unit_with_core(frame.as_bytes(), joc_input)
     {
-        Ok(Some(obj)) => {
+        JocReconstruction::Objects(obj) => {
             state.frame_count += 1;
             tick_progress(pb);
-            let _ = tx.send(Ok(Eac3FrameMessage::Object(obj)));
+            let _ = tx.send(Ok(Eac3FrameMessage::Object(*obj)));
             Ok(())
         }
-        Ok(None) => {
+        // The core comes back unused here, and the doc comment above says why
+        // it is dropped rather than emitted: the frame's bed has already been
+        // sent, so emitting it again would write it twice.
+        JocReconstruction::NoPayload(_) => {
             log::warn!(
                 "dropping E-AC-3 dependent substream without JOC after an already-emitted object frame"
             );
             Ok(())
         }
-        Err(err) => surface_decode_err(err, strict_mode, tx, pb, state, &frame.info()),
+        JocReconstruction::Failed(err, _) => {
+            surface_decode_err(err, strict_mode, tx, pb, state, &frame.info())
+        }
     }
 }
 

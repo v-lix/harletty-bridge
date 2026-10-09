@@ -18,9 +18,10 @@ pub use metadata::{
     OamdObjectBlock, OamdObjectElement, OamdPayload, ParsedEmdfPayloadData, ParsedEmdfPayloadKind,
 };
 pub use pcm::{
-    CORE_OAMD_LATENCY_SAMPLES, CorePcmFrame, JOC_LATENCY_SAMPLES, OAMD_LATENCY_SAMPLES,
-    ObjectPcmDecoder, ObjectPcmFrame, ObjectPcmPushResult, PcmDecoder, PcmPushResult,
-    dependent_chanmap_positions, merge_core_with_decoded_dependent, merge_core_with_dependent,
+    CORE_OAMD_LATENCY_SAMPLES, CorePcmFrame, JOC_LATENCY_SAMPLES, JocReconstruction,
+    OAMD_LATENCY_SAMPLES, ObjectPcmDecoder, ObjectPcmFrame, ObjectPcmPushResult, PcmDecoder,
+    PcmPushResult, dependent_chanmap_positions, merge_core_with_decoded_dependent,
+    merge_core_with_dependent,
 };
 pub use syncframe::{
     AccessUnitInfo, AudioFrameInfo, AuxParseStatus, BlockDrcInfo, EmdfBlockInfo, EmdfPayloadInfo,

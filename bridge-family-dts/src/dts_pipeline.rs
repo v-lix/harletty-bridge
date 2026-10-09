@@ -269,6 +269,13 @@ impl DtsPipeline {
         }
     }
 
+    /// The stream is over: emit what the Auro-3D stage holds
+    /// ([`DtsAuroState::end`]). Every other stage emits a frame as soon as it
+    /// is whole, and the bytes of an unfinished one cannot be decoded.
+    pub fn drain(&mut self, result: &mut RPushResult) {
+        self.auro.end(&mut result.frames);
+    }
+
     /// Forget the stream (seek, sync loss): the fold configuration stays.
     pub fn reset(&mut self) {
         self.buf.clear();

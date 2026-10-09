@@ -21,4 +21,10 @@
 # imports. bridge_api itself is the 0.6 of #782, unchanged since. Moved to the
 # merge of #831 for spdif 0.1.1: the IAMF burst writer the carrier test
 # (bridge/tests/iamf_carrier.rs) cuts its vectors with.
+#
+# This branch needs bridge_api 0.7 - 0.6 plus FormatBridge::drain, the
+# end-of-stream drain - which only the v-lix/Omniphony fork has so far (its
+# kodi-binaural-headphone branch). CI here checks out mgth/Omniphony at the
+# pin below and cannot build it until upstream takes the drain; CoreELEC
+# builds it against its own Omniphony pin.
 55af2c57d6092f72478c4a8f36350bb71703185e

@@ -76,6 +76,11 @@ impl FamilyPipeline for DtsPipeline {
         DtsPipeline::reset(self);
     }
 
+    fn drain(&mut self, _shared: &mut SharedState, out: &mut RPushResult) -> AfterPush {
+        DtsPipeline::drain(self, out);
+        AfterPush::Continue
+    }
+
     fn is_ready(&self) -> bool {
         DtsPipeline::is_ready(self)
     }

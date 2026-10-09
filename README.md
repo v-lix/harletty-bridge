@@ -70,9 +70,10 @@ and follow the three steps for your OS below.
 > ("Requires Omniphony ≥ …"). The current `main` requires **Omniphony
 > with `bridge_api` 0.6 that loads several bridges**: Omniphony `main`
 > since [mgth/Omniphony#785](https://github.com/mgth/Omniphony/pull/785),
-> and the first Omniphony release after 0.6.0. Older hosts refuse the
-> plugins. When a host loads a plugin, its log shows what it was built
-> from, e.g.
+> and the first Omniphony release after 0.6.0. This branch requires
+> `bridge_api` 0.7, which adds the end-of-stream drain and so far only the
+> v-lix/Omniphony fork has. Older hosts refuse the plugins. When a host
+> loads a plugin, its log shows what it was built from, e.g.
 > `harletty-dolby-bridge 0.9.0 (bridge_api 0.6.0, Omniphony c821eb34…)`.
 
 ### 🪟 Windows

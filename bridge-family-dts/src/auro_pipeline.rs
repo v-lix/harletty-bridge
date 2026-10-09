@@ -239,6 +239,29 @@ impl DtsAuroState {
         }
     }
 
+    /// The stream is over: what this stage holds goes out, since no frame is
+    /// coming to release it - undecided, the frames held for detection as
+    /// they are; unfolding, the samples the unfolder's one-block latency
+    /// holds back. It is then as a reset leaves it.
+    pub(crate) fn end(&mut self, out: &mut RVec<RDecodedFrame>) {
+        match &mut self.phase {
+            Phase::Undecided { .. } => self.give_up(out),
+            Phase::Unfolding {
+                unfolder,
+                outputs,
+                labels,
+                sample_rate,
+                scratch,
+                ..
+            } => {
+                unfolder.finish();
+                Self::drain(unfolder, outputs, labels, *sample_rate, scratch, out);
+            }
+            Phase::Plain => {}
+        }
+        self.reset();
+    }
+
     /// A frame without lossless output (core only) cannot be a carrier.
     pub(crate) fn not_a_carrier(&mut self, out: &mut RVec<RDecodedFrame>) {
         if matches!(self.phase, Phase::Undecided { .. }) {
@@ -526,6 +549,39 @@ mod tests {
         );
         assert_eq!(row(s)[1], carrier[1][s] & !0b111, "R plays as R");
         assert_eq!(row(s)[5], 0, "HR was never announced");
+
+        // The stream ends: the block the latency held back comes out too,
+        // unfolded, and the next stream is looked at afresh.
+        let before = out.len();
+        state.end(&mut out);
+        let emitted: usize = out.iter().map(|f| f.sample_count as usize).sum();
+        assert_eq!(emitted, total);
+        assert!(out[before..].iter().all(|f| f.channel_count == 8));
+        assert!(!state.is_unfolding());
+    }
+
+    #[test]
+    fn a_stream_ending_before_the_stage_decides_releases_what_it_held() {
+        let speakers = [1usize, 2];
+        let mut state = DtsAuroState::default();
+        let mut out = RVec::new();
+        let n = 512;
+        let frames = 4;
+        for f in 0..frames {
+            let l: Vec<i32> = (0..n).map(|i| (f * n + i) as i32 * 3).collect();
+            let r: Vec<i32> = (0..n).map(|i| -((f * n + i) as i32) * 3).collect();
+            let chans: Vec<&[i32]> = vec![&l, &r];
+            let frame = frame(&chans, &speakers);
+            let lossless = speakers.iter().copied().zip(chans.iter().copied());
+            state.route(frame, &speakers, lossless, &mut out);
+        }
+        assert!(out.is_empty(), "under the hold limit, everything is held");
+        state.end(&mut out);
+        assert_eq!(out.len(), frames, "every held frame came out");
+        assert_eq!(out[1].pcm[0], 512 * 3, "in order, unchanged");
+        out.clear();
+        state.end(&mut out);
+        assert!(out.is_empty(), "a second end has nothing left");
     }
 
     #[test]

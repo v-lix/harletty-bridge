@@ -91,6 +91,14 @@ pub trait FamilyPipeline: Send + Sync + 'static {
     /// configuration stays.
     fn reset(&mut self, shared: &SharedState);
 
+    /// The stream is over: emit what the family still holds, because no
+    /// packet is coming to release it (an E-AC-3 independent substream waits
+    /// for the next access unit to say whether a dependent follows). A
+    /// family that emits each access unit as it completes holds nothing.
+    fn drain(&mut self, _shared: &mut SharedState, _out: &mut RPushResult) -> AfterPush {
+        AfterPush::Continue
+    }
+
     /// A decoder panicked: drop what [`Self::reset`] keeps, its state being
     /// unknown (IAMF's sequence configuration).
     fn discard_after_panic(&mut self) {}
@@ -242,6 +250,28 @@ impl<F: FamilyPipeline> PluginBridge<F> {
         self.family.unsniffed()
     }
 
+    /// What a panic caught at the ABI boundary comes back as: the pipeline
+    /// reset, as a reset (see [`FormatBridge::push_packet`]).
+    fn recover_from_panic(&mut self, payload: Box<dyn std::any::Any + Send>) -> RPushResult {
+        let msg = format!("decoder panic: {}; pipeline reset", panic_message(&payload));
+        bridge_diag_log(log::Level::Error, &msg);
+        // The panicking decoder's state is unknown: what a reset keeps
+        // (IAMF's sequence configuration) is rebuilt as well.
+        self.family.discard_after_panic();
+        self.reset_pipeline();
+        RPushResult {
+            frames: RVec::new(),
+            // A host that did not ask for strict decoding plays through a
+            // reset; an error message would fail its call instead.
+            error_message: if self.shared.strict {
+                msg.into()
+            } else {
+                RString::new()
+            },
+            did_reset: true,
+        }
+    }
+
     /// The body of [`FormatBridge::push_packet`], which runs it under its
     /// panic guard.
     fn push_packet_unguarded(
@@ -315,25 +345,28 @@ impl<F: FamilyPipeline> FormatBridge for PluginBridge<F> {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.push_packet_unguarded(data.as_slice(), transport, data_type)
         }));
-        outcome.unwrap_or_else(|payload| {
-            let msg = format!("decoder panic: {}; pipeline reset", panic_message(&payload));
-            bridge_diag_log(log::Level::Error, &msg);
-            // The panicking decoder's state is unknown: what a reset keeps
-            // (IAMF's sequence configuration) is rebuilt as well.
-            self.family.discard_after_panic();
-            self.reset_pipeline();
-            RPushResult {
+        outcome.unwrap_or_else(|payload| self.recover_from_panic(payload))
+    }
+
+    /// Resolve what the family still holds, because no packet is coming to
+    /// end it ([`FamilyPipeline::drain`]); `reset` throws the same away,
+    /// which is what a seek wants and an ending does not. Under the packet's
+    /// panic guard, since it decodes like one. A failure is reported as one
+    /// during playback is, and what was held is taken either way, so a
+    /// second drain returns nothing.
+    fn drain(&mut self) -> RPushResult {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut result = RPushResult {
                 frames: RVec::new(),
-                // A host that did not ask for strict decoding plays through a
-                // reset; an error message would fail its call instead.
-                error_message: if self.shared.strict {
-                    msg.into()
-                } else {
-                    RString::new()
-                },
-                did_reset: true,
+                error_message: RString::new(),
+                did_reset: false,
+            };
+            if self.family.drain(&mut self.shared, &mut result) == AfterPush::ResetPipeline {
+                self.reset_pipeline();
             }
-        })
+            result
+        }));
+        outcome.unwrap_or_else(|payload| self.recover_from_panic(payload))
     }
 
     fn reset(&mut self) {

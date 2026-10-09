@@ -404,6 +404,20 @@ impl FamilyPipeline for Families {
         }
     }
 
+    /// Only the Dolby family holds an access unit (E-AC-3's independent
+    /// substream), and only while E-AC-3 is the stream's codec: one left for
+    /// DTS or IAMF stays held ([`DolbyPipeline::leave`]), as draining it
+    /// would put stale audio after what played since.
+    fn drain(&mut self, shared: &mut SharedState, result: &mut RPushResult) -> AfterPush {
+        #[cfg(feature = "dolby")]
+        return self.dolby.drain(shared, result);
+        #[cfg(not(feature = "dolby"))]
+        {
+            let _ = (shared, result);
+            AfterPush::Continue
+        }
+    }
+
     /// IAMF keeps its sequence configuration across a reset: after a panic in
     /// its path, it is rebuilt from the next sequence header.
     fn discard_after_panic(&mut self) {
@@ -1598,5 +1612,114 @@ mod panic_guard_tests {
             "{}",
             after.error_message
         );
+    }
+}
+
+#[cfg(all(test, feature = "dolby"))]
+mod drain_tests {
+    use super::*;
+
+    /// One independent E-AC-3 access unit: the bridge holds it until the next
+    /// unit says whether a dependent follows it.
+    const INDEPENDENT: &[u8] = include_bytes!("../../eac3/tests/data/aht_independent_stereo.bin");
+
+    /// What a stream one access unit long decodes to: nothing until the host
+    /// drains, then the held unit, once.
+    #[test]
+    fn a_drain_emits_the_held_access_unit_once() {
+        let mut bridge = AtmosBridge::new(false);
+        let pushed = bridge.push_packet(RSlice::from_slice(INDEPENDENT), RInputTransport::Raw, 0);
+        assert!(pushed.frames.is_empty(), "the unit is held, not emitted");
+
+        let drained = bridge.drain();
+        assert!(
+            drained.error_message.is_empty(),
+            "{}",
+            drained.error_message
+        );
+        assert!(!drained.did_reset);
+        assert_eq!(drained.frames.len(), 1);
+        assert!(drained.frames[0].sample_count > 0);
+        assert!(
+            bridge.drain().frames.is_empty(),
+            "a second drain finds nothing"
+        );
+    }
+
+    /// A reset is a seek: the unit it seeks away from is discarded, not
+    /// emitted by a later drain.
+    #[test]
+    fn a_reset_discards_what_a_drain_would_emit() {
+        let mut bridge = AtmosBridge::new(false);
+        bridge.push_packet(RSlice::from_slice(INDEPENDENT), RInputTransport::Raw, 0);
+        bridge.reset();
+        assert!(bridge.drain().frames.is_empty());
+    }
+
+    /// IEC 61937 names the codec of every burst, so a stream can move from
+    /// E-AC-3 to DTS without a reset, leaving the held E-AC-3 unit behind:
+    /// the drain at its end has nothing of the earlier codec to emit after
+    /// the DTS audio.
+    #[cfg(feature = "dts")]
+    #[test]
+    fn a_drain_after_a_switch_away_from_eac3_emits_nothing_stale() {
+        const DTS: &[u8] = include_bytes!("../../harletty/tests/fixtures/dts_core_tone_10f.dts");
+        let mut bridge = AtmosBridge::new(false);
+        let pushed = bridge.push_packet(
+            RSlice::from_slice(INDEPENDENT),
+            RInputTransport::Iec61937,
+            0x15, // E-AC-3
+        );
+        assert!(pushed.error_message.is_empty(), "{}", pushed.error_message);
+        assert!(pushed.frames.is_empty(), "the unit is held, not emitted");
+
+        let mut dts_frames = 0;
+        for frame in DTS.chunks(DTS.len() / 10) {
+            let dts = bridge.push_packet(
+                RSlice::from_slice(frame),
+                RInputTransport::Iec61937,
+                0x0B, // DTS type I: the frame goes in as it is
+            );
+            assert!(dts.error_message.is_empty(), "{}", dts.error_message);
+            dts_frames += dts.frames.len();
+        }
+        assert!(dts_frames > 0, "the DTS stream decodes");
+
+        let drained = bridge.drain();
+        assert!(
+            drained.error_message.is_empty(),
+            "{}",
+            drained.error_message
+        );
+        assert!(drained.frames.is_empty(), "no stale E-AC-3 frame");
+    }
+
+    /// Raw transport keeps the codec it sniffed, but a new `input_codec`
+    /// makes it sniff again without a reset: the same switch, the same
+    /// nothing to drain.
+    #[cfg(feature = "dts")]
+    #[test]
+    fn a_drain_after_a_raw_switch_away_from_eac3_emits_nothing_stale() {
+        const DTS: &[u8] = include_bytes!("../../harletty/tests/fixtures/dts_core_tone_10f.dts");
+        let mut bridge = AtmosBridge::new(false);
+        let pushed = bridge.push_packet(RSlice::from_slice(INDEPENDENT), RInputTransport::Raw, 0);
+        assert!(pushed.frames.is_empty(), "the unit is held, not emitted");
+        assert!(bridge.configure("input_codec".into(), "auto".into()));
+
+        let mut dts_frames = 0;
+        for packet in DTS.chunks(DTS.len() / 10) {
+            let dts = bridge.push_packet(RSlice::from_slice(packet), RInputTransport::Raw, 0);
+            assert!(dts.error_message.is_empty(), "{}", dts.error_message);
+            dts_frames += dts.frames.len();
+        }
+        assert!(dts_frames > 0, "the DTS stream decodes");
+
+        let drained = bridge.drain();
+        assert!(
+            drained.error_message.is_empty(),
+            "{}",
+            drained.error_message
+        );
+        assert!(drained.frames.is_empty(), "no stale E-AC-3 frame");
     }
 }

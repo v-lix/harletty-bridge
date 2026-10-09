@@ -614,6 +614,37 @@ impl DolbyPipeline {
         }
     }
 
+    /// Resolve the E-AC-3 presentation still in hand, because no access unit is
+    /// coming to end it.
+    ///
+    /// An independent substream is held until the next unit says whether a
+    /// dependent follows it (see `process_eac3_access_unit`), so one can remain
+    /// at the end of a stream. It may be the whole of a track short enough to
+    /// be one access unit. [`Self::reset`] throws the same frame away, which is
+    /// what a seek wants and an ending does not.
+    ///
+    /// The TrueHD path emits each access unit as it completes and has nothing
+    /// buffered to release.
+    ///
+    /// A resolve failure is reported the way one during playback is - the
+    /// message in `error_message`, the pipeline reset - rather than being
+    /// swallowed because the stream is ending anyway. The presentation is
+    /// taken either way, so a second drain finds nothing and returns no frames.
+    ///
+    /// Only while E-AC-3 is still the current codec, though. A stream that
+    /// moved on to TrueHD or another family without a reset - IEC 61937 names
+    /// the codec of every burst - left the presentation behind, and emitting it
+    /// now would put stale audio after what played since.
+    pub fn drain(&mut self, shared: &mut SharedState, result: &mut RPushResult) -> AfterPush {
+        if !self.eac3_active {
+            return AfterPush::Continue;
+        }
+        match self.finish_presentation(shared, result) {
+            Ok(()) => AfterPush::Continue,
+            Err(()) => AfterPush::ResetPipeline,
+        }
+    }
+
     /// Resolve the pending presentation, applying the pipeline's failure
     /// policy: strict mode surfaces the error and resets, as every other decode
     /// failure here does.
@@ -1049,6 +1080,20 @@ pub(crate) mod test_bridge {
             result
         }
 
+        pub(crate) fn drain(&mut self) -> RPushResult {
+            let mut result = RPushResult {
+                frames: RVec::new(),
+                error_message: RString::new(),
+                did_reset: false,
+            };
+            if self.dolby.drain(&mut self.shared, &mut result) == AfterPush::ResetPipeline {
+                self.dolby.reset(&self.shared);
+                self.shared.declared_object_channels = None;
+                self.locked = None;
+            }
+            result
+        }
+
         pub(crate) fn configure(&mut self, key: RStr<'_>, value: RStr<'_>) -> bool {
             if key.as_str() == "input_codec" {
                 self.forced = match value.as_str() {
@@ -1346,6 +1391,10 @@ impl FamilyPipeline for DolbyPipeline {
 
     fn reset(&mut self, shared: &SharedState) {
         DolbyPipeline::reset(self, shared);
+    }
+
+    fn drain(&mut self, shared: &mut SharedState, out: &mut RPushResult) -> AfterPush {
+        DolbyPipeline::drain(self, shared, out)
     }
 
     fn configure(&mut self, key: &str, value: &str) -> Option<bool> {

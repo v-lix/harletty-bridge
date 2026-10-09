@@ -1,8 +1,8 @@
 use abi_stable::std_types::RVec;
 use bridge_api::{RChannelLabel, RDecodedFrame, RMetadataFrame};
 use eac3::{
-    AccessUnitInfo, AccessUnitParseError, BedChannel, CorePcmFrame, FrameType, OamdPayload,
-    ObjectPcmPushResult, ParsedEmdfPayloadData, inspect_access_unit,
+    AccessUnitInfo, AccessUnitParseError, BedChannel, CorePcmFrame, FrameType, JocReconstruction,
+    OamdPayload, ObjectPcmPushResult, ParsedEmdfPayloadData, inspect_access_unit,
 };
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -454,9 +454,9 @@ pub(crate) fn resolve_eac3_presentation(
 
     match bridge
         .eac3_object_decoder
-        .push_access_unit_with_core(last, bed.clone())
+        .push_access_unit_with_core(last, bed)
     {
-        Ok(Some(result)) => {
+        JocReconstruction::Objects(result) => {
             update_eac3_dialogue_level(bridge, &result.info);
             let sample_count = result.pcm.samples_per_channel();
             let base_sample_pos = bridge.eac3_total_samples;
@@ -465,7 +465,7 @@ pub(crate) fn resolve_eac3_presentation(
             bridge.perf.maybe_report(bridge.eac3_frame_count);
             maybe_dump_ok_frame(last, "depobj");
             Ok(build_eac3_frame_from_object(
-                result,
+                *result,
                 base_sample_pos,
                 bridge,
                 shared,
@@ -474,7 +474,7 @@ pub(crate) fn resolve_eac3_presentation(
         // The dependent announced a JOC payload the decoder then found nothing
         // in. The merged bed is real audio either way, and dropping the whole
         // interval to report that is worse than emitting it.
-        Ok(None) => {
+        JocReconstruction::NoPayload(bed) => {
             bridge.eac3_diag_stats.dependent_pair_no_object += 1;
             bridge.eac3_diag_stats.last_dependent_pair_error =
                 Some("no_object_payload".to_string());
@@ -483,7 +483,7 @@ pub(crate) fn resolve_eac3_presentation(
             bridge.eac3_total_samples += sample_count as u64;
             Ok(build_eac3_channel_bed_frame(&bed, Some(&dep_info), bridge))
         }
-        Err(err) => {
+        JocReconstruction::Failed(err, bed) => {
             let diag = eac3_frame_reject_diag(last);
             maybe_dump_reject_frame(last, "depobj");
             let message = format!("E-AC3 dependent object decode error: {err} {diag}");
@@ -1818,6 +1818,36 @@ mod presentation_assembly {
             bridge.dolby.pending_eac3_core.is_some(),
             "the second independent is now the one being held"
         );
+    }
+
+    /// At the end of a stream no access unit comes to end the presentation in
+    /// hand, so the drain does: the held core comes out once, and a reset
+    /// discards it instead.
+    #[test]
+    fn a_drain_emits_the_held_core_once_and_a_reset_discards_it() {
+        let mut bridge = TestBridge::new(false);
+        assert_eq!(push(&mut bridge, INDEPENDENT), 0);
+        let drained = bridge.drain();
+        assert!(
+            drained.error_message.is_empty(),
+            "{}",
+            drained.error_message
+        );
+        assert!(!drained.did_reset);
+        assert_eq!(drained.frames.len(), 1, "the held core is emitted");
+        assert!(bridge.dolby.pending_eac3_core.is_none());
+        assert!(
+            bridge.drain().frames.is_empty(),
+            "a second drain finds nothing"
+        );
+
+        // The bridge keeps decoding after a drain.
+        assert_eq!(push(&mut bridge, INDEPENDENT), 0);
+        assert_eq!(push(&mut bridge, INDEPENDENT), 1);
+
+        // A seek is not an ending: what it seeks away from is not emitted.
+        bridge.dolby.reset(&bridge.shared);
+        assert!(bridge.drain().frames.is_empty());
     }
 
     /// A JOC payload the frame's own channels satisfy still costs no latency.

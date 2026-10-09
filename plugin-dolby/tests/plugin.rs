@@ -125,3 +125,28 @@ fn a_dolby_stream_is_claimed_and_decoded() {
         assert!(bridge.set_drc_mode(mode.into()), "{mode}");
     }
 }
+
+/// The E-AC-3 unit the bridge holds until the next access unit is released
+/// by a drain at the end of the stream, once, and thrown away by a reset.
+#[test]
+fn a_drain_emits_the_held_eac3_unit_once() {
+    const INDEPENDENT: &[u8] = include_bytes!("../../eac3/tests/data/aht_independent_stereo.bin");
+    let mut bridge = lib().new_bridge()(false);
+    let pushed = bridge.push_packet(RSlice::from_slice(INDEPENDENT), RInputTransport::Raw, 0);
+    assert!(pushed.frames.is_empty(), "the unit is held, not emitted");
+    let drained = bridge.drain();
+    assert!(
+        drained.error_message.is_empty(),
+        "{}",
+        drained.error_message
+    );
+    assert_eq!(drained.frames.len(), 1);
+    assert!(
+        bridge.drain().frames.is_empty(),
+        "a second drain finds nothing"
+    );
+
+    bridge.push_packet(RSlice::from_slice(INDEPENDENT), RInputTransport::Raw, 0);
+    bridge.reset();
+    assert!(bridge.drain().frames.is_empty(), "a reset discards it");
+}
